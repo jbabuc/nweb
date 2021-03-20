@@ -14,51 +14,48 @@
 #include <time.h>
 #include <stdlib.h>
 
-#define VERSION 23
 #define BUFSIZE 1024 * 1000
-#define ERROR 42
-#define LOG 44
 #define FORBIDDEN 403
 #define NOTFOUND 404
 
-#ifndef SIGCLD
-#define SIGCLD SIGCHLD
-#endif
+#define STR_TIME ctime(localtime())
+#define KEEPALIVE 1
+#define RECEIVE_TIMEOUT_SEC 10
 
-char* LOGFILE;
-
-void logger(int type, char* s1, char* s2, int socket_fd)
-{
-    int fd;
-    char logbuffer[BUFSIZE];
-
-    switch (type) {
-    case ERROR:
-        (void)sprintf(logbuffer, "ERROR: %s:%s Errno=%d exiting pid=%d", s1, s2, errno, getpid());
-        break;
-    case FORBIDDEN:
-        (void)write(socket_fd, "HTTP/1.1 403 Forbidden\nContent-Length: 185\nConnection: close\nContent-Type: text/html\n\n<html><head>\n<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\nThe requested URL, file type or operation is not allowed on this simple static file webserver.\n</body></html>\n", 271);
-        (void)sprintf(logbuffer, "FORBIDDEN: %s:%s", s1, s2);
-        break;
-    case NOTFOUND:
-        (void)write(socket_fd, "HTTP/1.1 404 Not Found\nContent-Length: 136\nConnection: close\nContent-Type: text/html\n\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\nThe requested URL was not found on this server.\n</body></html>\n", 224);
-        (void)sprintf(logbuffer, "NOT FOUND: %s:%s", s1, s2);
-        break;
-    case LOG:
-        (void)sprintf(logbuffer, "%s:%s:%d", s1, s2, socket_fd);
-        break;
-    }
-    /* No checks here, nothing can be done with a failure anyway */
-    if ((fd = open(LOGFILE, O_CREAT | O_WRONLY | O_APPEND, 0644)) >= 0) {
-        (void)write(fd, logbuffer, strlen(logbuffer));
-        (void)write(fd, "\n", 1);
-        (void)close(fd);
-    }
-    if (type == ERROR || type == NOTFOUND || type == FORBIDDEN)
-        exit(3);
+#define PRINT_LOG(str_format, ...)                                  \
+    {                                                               \
+        time_t curtime = time(NULL);                                \
+        struct tm* ltm = localtime(&curtime);                       \
+        printf("[%d-%02d-%02d %02d:%02d:%02d] " str_format,         \
+            ltm->tm_year + 1900, ltm->tm_mon + 1, ltm->tm_mday,     \
+            ltm->tm_hour, ltm->tm_min, ltm->tm_sec, ##__VA_ARGS__); \
+    \
 }
 
-void listdir(char* str_dirname, int fd, char* bigbuffer)
+// input and output could be same array, for output will be smaller than input
+void url_decode(const char* input, char* output)
+{
+    while (*input) {
+        if (*input == '%') {
+            char b[3] = { input[1], input[2], 0 };
+            *output++ = strtol(b, NULL, 16);
+            input += 3;
+        }
+        else {
+            *output++ = *input++;
+        }
+    }
+    *output = 0; // null terminate
+}
+
+void send_error(int socketfd, int http_ret_code, char* http_msg, char* bigbuffer)
+{
+    PRINT_LOG("[%d] Error return, %d, %s\n", getpid(), http_ret_code, http_msg);
+    sprintf(bigbuffer, "HTTP/1.1 %d\nContent-Length: %d\nContent-Type: text/html\n\n%s", http_ret_code, strlen(http_msg), http_msg);
+    write(socketfd, bigbuffer, strlen(bigbuffer));
+}
+
+void listdir(char* str_dirname, int socketfd, char* bigbuffer)
 {
     struct myfile {
         struct stat s;
@@ -83,7 +80,7 @@ void listdir(char* str_dirname, int fd, char* bigbuffer)
         return (*mf2)->s.st_mtime - (*mf1)->s.st_mtime;
     }
 
-    static char buffer[2048];
+    char buffer[2048];
 
     DIR* dp;
     struct dirent* ep;
@@ -123,183 +120,220 @@ void listdir(char* str_dirname, int fd, char* bigbuffer)
     qsort(arr_files, nfiles, sizeof(void*), myfilecmp);
 
     // write
-    (void)sprintf(buffer, "HTTP/1.1 200 OK\nServer: nweb/%d.0\nContent-Type: text/html\n\n<html><head><style>td { padding: 0 10; }</style><head><body style=\"font-family: consolas\"><table border=0>\n", VERSION);
-    (void)write(fd, buffer, strlen(buffer));
+    sprintf(buffer, "HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><head><style>td { padding: 0 10; }</style></head><body style=\"font-family: consolas\"><table border=0>\n");
+    write(socketfd, buffer, strlen(buffer));
 
-    int bigbuffer_size = 0;
+    int bigbuffer_pos = 0;
+    char str_fsize[16];
+
     for (i = 0; i < nfiles; i++) {
         // puts(arr_files[i]->name);
 
-        char str_fsize[16];
         if (arr_files[i]->s.st_mode & S_IFDIR) {
             str_fsize[0] = 0;
         }
         else {
             int fsize = arr_files[i]->s.st_size / 1024;
-            (void)sprintf(str_fsize, "%d%s", fsize > 0 ? fsize : arr_files[i]->s.st_size, fsize > 0 ? "kb" : "b");
+            sprintf(str_fsize, "%d%s", fsize > 0 ? fsize : arr_files[i]->s.st_size, fsize > 0 ? "kb" : "b");
         }
 
-        (void)sprintf(buffer, "<tr><td>%s</td><td>%s</td><td><a href=\"./%s\">%s</a></td></tr>\n", ctime(&(arr_files[i]->s.st_mtime)), str_fsize, arr_files[i]->name, arr_files[i]->name);
+        sprintf(buffer, "<tr><td>%s</td><td>%s</td><td><a href=\"./%s\">%s</a></td></tr>\n", ctime(&(arr_files[i]->s.st_mtime)), str_fsize, arr_files[i]->name, arr_files[i]->name);
 
         int blen = strlen(buffer);
-        if (bigbuffer_size + blen >= BUFSIZE) {
-            (void)write(fd, bigbuffer, strlen(bigbuffer));
-            bigbuffer_size = 0;
+        if (bigbuffer_pos + blen >= BUFSIZE) {
+            if (write(socketfd, bigbuffer, strlen(bigbuffer)) < 0) { // error, probably closed connection
+                PRINT_LOG("Write error. Probably closed connection, ignore\n");
+                break;
+            }
+            bigbuffer_pos = 0;
         }
-        sprintf(&bigbuffer[bigbuffer_size], "%s", buffer);
-        bigbuffer_size += blen;
+        sprintf(&bigbuffer[bigbuffer_pos], "%s", buffer);
+        bigbuffer_pos += blen;
     }
-    (void)write(fd, bigbuffer, strlen(bigbuffer));
-    (void)sprintf(buffer, "</table></body></html>", VERSION);
-    (void)write(fd, buffer, strlen(buffer));
+    write(socketfd, bigbuffer, strlen(bigbuffer));
+    sprintf(buffer, "</table></body></html>");
+    write(socketfd, buffer, strlen(buffer));
 
     for (i = 0; i < nfiles; i++) {
         free(arr_files[i]); // free memory
     }
 
-    (void)closedir(dp);
+    closedir(dp);
 }
 
 /* this is a child web server process, so we can exit on errors */
-void web(int fd, int hit)
+void web(int socketfd)
 {
-    int i, j;
-    static char buffer[BUFSIZE + 1]; /* static so zero filled */
-
-    long ret = read(fd, buffer, BUFSIZE); /* read Web request in one go */
-    if (ret == 0 || ret == -1) { /* read failure stop now */
-        logger(FORBIDDEN, "failed to read browser request", "", fd);
-    }
-    /* return code is valid chars */
-    if (ret > 0 && ret < BUFSIZE)
-        buffer[ret] = 0; /* terminate the buffer */
-    else
-        buffer[0] = 0;
-
-    /* remove CF and LF characters */
-    for (i = 0; i < ret; i++) {
-        if (buffer[i] == '\r' || buffer[i] == '\n')
-            buffer[i] = '*';
+    struct timeval tv;
+    tv.tv_sec = RECEIVE_TIMEOUT_SEC;
+    tv.tv_usec = RECEIVE_TIMEOUT_SEC * 1000;
+    // code supports only GET, so, no need for extensive receive time
+    if (setsockopt(socketfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        PRINT_LOG("[%d] Error setting socket receive timeout.", getpid());
     }
 
-    // logger(LOG, "FULL REQUEST", buffer, hit);
-    if (strncmp(buffer, "GET ", 4) && strncmp(buffer, "get ", 4)) {
-        logger(FORBIDDEN, "Only simple GET operation supported", buffer, fd);
-    }
-    for (i = 4; i < BUFSIZE; i++) { /* null terminate after the second space to ignore extra stuff */
-        if (buffer[i] == ' ') { /* string is "GET URL " +lots of other stuff */
-            buffer[i] = 0;
-            break;
-        }
-    }
-
-    /* check for illegal parent directory use .. */
-    for (j = 0; j < i - 1; j++) {
-        if (buffer[j] == '.' && buffer[j + 1] == '.') {
-            logger(FORBIDDEN, "Parent directory (..) path names not supported", buffer, fd);
-        }
-    }
-
-    logger(LOG, "REQUEST", buffer, hit);
-
-    /* 5th char is a slash, ignore it */
-    if (strlen(&buffer[5]) == 0)
-        strcpy(&buffer[5], "./");
-    char requested[strlen(&buffer[5]) + 1];
-    strcpy(requested, &buffer[5]);
-
-    struct stat s;
-    if (stat(&buffer[5], &s) == 0) { /* file found */
-        if (s.st_mode & S_IFDIR) { /* directory */
-            listdir(&buffer[5], fd, buffer);
-        }
-        else { /* file */
-            int file_fd = open(&buffer[5], O_RDONLY);
-            int len = (long)lseek(file_fd, (off_t)0, SEEK_END); /* lseek to the file end to find the length */
-            (void)lseek(file_fd, (off_t)0, SEEK_SET); /* lseek back to the file start ready for reading */
-            (void)sprintf(buffer, "HTTP/1.1 200 OK\nServer: nweb/%d.0\nContent-Length: %ld\nConnection: close\n\n", VERSION, len); /* Header + a blank line */
-            // logger(LOG, "Header ", buffer, hit);
-            (void)write(fd, buffer, strlen(buffer));
-
-            /* send file in buffer size block - last block may be smaller */
-            while ((ret = read(file_fd, buffer, BUFSIZE)) > 0) {
-                (void)write(fd, buffer, ret);
+    char buffer[BUFSIZE + 1];
+    while (KEEPALIVE) {
+        {
+            // read socket
+            long ret = read(socketfd, buffer, BUFSIZE); /* read Web request in one go */
+            if (ret > 0 && ret < BUFSIZE) {
+                buffer[ret] = 0; /* terminate the buffer */
+            }
+            else {
+                break;
             }
         }
 
-        sleep(1); /* allow socket to drain before signalling the socket is closed */
-        close(fd);
-        exit(1);
+        // PRINT_LOG("[%d] Full request, \n---------------------%s---------------------\n", getpid(), buffer);
+        if (strncmp(buffer, "GET ", 4) && strncmp(buffer, "get ", 4)) {
+            send_error(socketfd, FORBIDDEN, "Only GET is supported", buffer);
+            continue;
+        }
+
+        { // keep only url
+            int i;
+            for (i = 4; i < BUFSIZE; i++) {
+                if (buffer[i] == ' ') {
+                    buffer[i] = 0;
+                    break;
+                }
+            }
+        }
+
+        url_decode(buffer[4] == '/' ? &buffer[5] : &buffer[4], buffer);
+
+        { //check for illegal parent directory use ..
+            int i = 0, n = strlen(buffer);
+            for (i = 0; i < n - 1; i++) {
+                if (buffer[i] == '.' && buffer[i + 1] == '.') {
+                    send_error(socketfd, FORBIDDEN, "Parent directory (..) path names not supported", buffer);
+                    continue;
+                }
+            }
+        }
+
+        /* 5th char is a slash, ignore it */
+        if (strlen(buffer) == 0)
+            strcpy(buffer, ".");
+
+        PRINT_LOG("[%d] Requested, %s\n", getpid(), buffer);
+
+        struct stat s;
+        if (stat(buffer, &s) == 0) { /* file found */
+            if (s.st_mode & S_IFDIR) { /* directory */
+                listdir(buffer, socketfd, buffer);
+                // content length unknown, so, exit socket. else, client will not know if stream ended.
+                break;
+            }
+            else { /* file */
+                int file_fd = open(buffer, O_RDONLY | O_NONBLOCK);
+                if (file_fd < 0) {
+                    send_error(socketfd, NOTFOUND, "Not Found", buffer);
+                    continue;
+                }
+
+                long len = (long)lseek(file_fd, (off_t)0, SEEK_END); /* lseek to the file end to find the length */
+                lseek(file_fd, (off_t)0, SEEK_SET); /* lseek back to the file start ready for reading */
+                sprintf(buffer, "HTTP/1.1 200 OK\nServer: nweb\nContent-Length: %ld\n\n", len);
+                // PRINT_LOG("Header: HTTP/1.1 200 OK\nServer: nweb\nContent-Length: %ld\n\n", len);
+                write(socketfd, buffer, strlen(buffer));
+
+                /* send file in buffer size block - last block may be smaller */
+                int nread;
+                while ((nread = read(file_fd, buffer, BUFSIZE)) > 0) {
+                    if (write(socketfd, buffer, nread) < 0) { // error, probably closed connection
+                        PRINT_LOG("Write error. Probably closed connection, ignore and exit\n ");
+                        break;
+                    }
+                }
+                close(file_fd);
+                sleep(1);
+            }
+        }
+        else { /* file not found */
+            send_error(socketfd, NOTFOUND, "Not Found", buffer);
+            continue;
+        }
     }
 
-    logger(NOTFOUND, "Failed to open file", &buffer[5], fd);
+    // PRINT_LOG("[%d] Child exiting...\n", getpid());
+    shutdown(socketfd, SHUT_WR);
+    close(socketfd);
+    exit(0);
 }
 
 int main(int argc, char** argv)
 {
-    int i, port, pid, listenfd, socketfd, hit;
-    socklen_t length;
+    int i, pid, listenfd, socketfd;
     static struct sockaddr_in cli_addr; /* static = initialised to zeros */
     static struct sockaddr_in serv_addr; /* static = initialised to zeros */
 
-    if (argc < 4 || argc > 4 || !strcmp(argv[1], "-?")) {
-        (void)printf("\thint: nweb Port-Number Top-Directory LOGFILE\t\tversion %d\n\n"
-                     "\tnweb is a small and very safe mini web server\n"
-                     "\tserves only from the named directory or its sub-directories.\n"
-                     "\tThere is no fancy features = safe and secure.\n\n"
-                     "\tExample: nweb 8181 /home/nwebdir /home/logfile&\n\n",
-            VERSION);
+    if (argc < 3 || argc > 3 || !strcmp(argv[1], "-?")) {
+        PRINT_LOG("\thint: nweb Port-Number Top-Directory\n"
+                  "\tnweb is a small and very safe mini web server\n"
+                  "\tserves only from the named directory or its sub-directories\n"
+                  "\tThere is no fancy features = safe and secure\n\n"
+                  "\tExample: nweb 8181 /home/nwebdir\n\n");
 
-        (void)printf("\tNot Supported: directories / /etc /bin /lib /tmp /usr /dev /sbin \n"
-                     "\tNo warranty given or implied\n\tNigel Griffiths nag@uk.ibm.com\n"
-                     "\tDirectory listing function added by Janardhan Babu Chinta\n");
+        PRINT_LOG("\tNot Supported: directories / /etc /bin /lib /tmp /usr /dev /sbin \n"
+                  "\tNo warranty given or implied, Nigel Griffiths nag@uk.ibm.com\n"
+                  "\tDirectory listing function added by Janardhan Babu Chinta\n");
         exit(0);
     }
     if (!strncmp(argv[2], "/", 2) || !strncmp(argv[2], "/etc", 5) || !strncmp(argv[2], "/bin", 5) || !strncmp(argv[2], "/lib", 5) || !strncmp(argv[2], "/tmp", 5) || !strncmp(argv[2], "/usr", 5) || !strncmp(argv[2], "/dev", 5) || !strncmp(argv[2], "/sbin", 6)) {
-        (void)printf("ERROR: Bad top directory %s, see nweb -?\n", argv[2]);
+        PRINT_LOG("ERROR: Bad top directory %s, see nweb -?\n", argv[2]);
         exit(3);
     }
-    LOGFILE = argv[3];
-    if (chdir(argv[2]) == -1) {
-        (void)printf("ERROR: Can't Change to directory %s\n", argv[2]);
-        exit(4);
+    if (chroot(argv[2]) == -1) {
+        PRINT_LOG("ERROR: Can't root to directory %s\n", argv[2]);
+        if (chdir(argv[2]) == -1) {
+            PRINT_LOG("ERROR: Can't Change to directory %s\n", argv[2]);
+            exit(4);
+        }
     }
-    /* Become deamon + unstopable and no zombies children (= no wait()) */
-    if (fork() != 0)
-        return 0; /* parent returns OK to shell */
-    (void)signal(SIGCLD, SIG_IGN); /* ignore child death */
-    (void)signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
-    for (i = 0; i < 32; i++)
-        (void)close(i); /* close open files */
-    (void)setpgrp(); /* break away from process group */
-    logger(LOG, "nweb starting", argv[1], getpid());
+
+    signal(SIGCHLD, SIG_IGN); /* let kernel automatically reap children */
+    setpgrp(); /* break away from process group */
     /* setup the network socket */
-    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        logger(ERROR, "system call", "socket", 0);
-    port = atoi(argv[1]);
-    if (port < 0 || port > 60000)
-        logger(ERROR, "Invalid port number (try 1->60000)", argv[1], 0);
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        PRINT_LOG("Error creating socket\n");
+        exit(6);
+    }
+
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serv_addr.sin_port = htons(port);
-    if (bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-        logger(ERROR, "system call", "bind", 0);
-    if (listen(listenfd, 64) < 0)
-        logger(ERROR, "system call", "listen", 0);
-    for (hit = 1;; hit++) {
-        length = sizeof(cli_addr);
-        if ((socketfd = accept(listenfd, (struct sockaddr*)&cli_addr, &length)) < 0)
-            logger(ERROR, "system call", "accept", 0);
+    serv_addr.sin_port = htons(atoi(argv[1]));
+    if (bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        PRINT_LOG("Error binding socket to port, %s\n", argv[1]);
+        exit(6);
+    }
+
+    if (listen(listenfd, 64) < 0) {
+        PRINT_LOG("Error listening to port, %s\n", argv[1]);
+        exit(7);
+    }
+
+    PRINT_LOG("nweb started at port %s, pid %d\n", argv[1], getpid());
+
+    while (1) {
+        socklen_t length = sizeof(cli_addr);
+
+        if ((socketfd = accept(listenfd, (struct sockaddr*)&cli_addr, &length)) < 0) {
+            PRINT_LOG("Accept error\n");
+        }
+
         if ((pid = fork()) < 0) {
-            logger(ERROR, "system call", "fork", 0);
+            PRINT_LOG("Fork error\n");
         }
         else {
             if (pid == 0) { /* child */
-                (void)close(listenfd);
-                web(socketfd, hit); /* never returns */
+                PRINT_LOG("[%d] Serving client, %s:%d\n", getpid(), inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port));
+                close(listenfd); // child has no use with server socket
+                web(socketfd); /* never returns, serves request and exits */
             }
             else { /* parent */
-                (void)close(socketfd);
+                close(socketfd); // parent has no use with client socket
             }
         }
     }
@@ -314,15 +348,16 @@ COPY nweb.c /nweb.c
 COPY run.sh /run.sh
 RUN chmod +x /run.sh
 RUN gcc -static -o /nwebs nweb.c
-CMD /run.s
+CMD /run.sh
 
 run.sh-------------
 /nwebs 3140 /webroot /webroot/nweb.log
+cp /nwebs /webroot/
 sleep 5000
 
-Executed below commands
-	docker build -t nwebs:1
-	docker run -v /root:/webroot nwebs:1 &
-	docker exec -it containerid sh
-	copied the nwebs from container / to /webroot which is docker lab server /root and downloaded /root/nwebs on browser
+Executed below commands-------------
+docker build -t nwebs:1
+docker run -v /root:/webroot nwebs:1 &
+docker exec -it containerid sh
+nwebs is copied /root. downloaded on browser
 */
