@@ -19,7 +19,6 @@
 #define FORBIDDEN 403
 #define NOTFOUND 404
 
-#define STR_TIME ctime(localtime())
 #define KEEPALIVE 1
 #define RECEIVE_TIMEOUT_SEC 10
 
