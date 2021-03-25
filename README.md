@@ -8,6 +8,7 @@
 <li>log to console client ip and time</li>
 <li>simplified error handling code</li>
 <li>logging improvements</li>
+<li>support for default favicon.icon</li>
 <li>nwebs, statically compiled binary for linux</li>
 </ul>
 </body>
