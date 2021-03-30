@@ -10,6 +10,7 @@
           <li>simplified error handling code</li>
           <li>logging improvements</li>
           <li>support for default favicon.ico</li>
+          <li>suppor for range headers, for better streaming</li>
         </ul>
       <li>nwebs, statically compiled binary for linux</li>
     </ul>
