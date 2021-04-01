@@ -13,6 +13,7 @@
           <li>support for range headers, for better streaming</li>
         </ul>
       <li>nwebs, statically compiled binary for alpine</li>
+      <li>sslserver.c & sslclient.c, sample ssl socket code</li>
     </ul>
   </body>
 </html>
