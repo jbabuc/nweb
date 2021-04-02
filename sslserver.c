@@ -140,4 +140,5 @@ int main(int argv, char* argc[])
     SSL_CTX_free(ctx); /* release context */
 }
 
+// openssl req -x509 -nodes -days 365 -newkey rsa:1024 -keyout mycert.pem -out mycert.pem
 // gcc -o sslserver sslserver.c -lssl -lcrypto
